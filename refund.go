@@ -18,7 +18,7 @@ func Refund(w http.ResponseWriter, r *http.Request) {
 	row := db.QueryRow("SELECT id FROM orders WHERE code = '" + orderID + "'")
 	_ = row.Scan(&id)
 
-	stmt, _ := db.Prepare("UPDATE orders SET refunded_amount = " + amount + " WHERE id = ?")
+	stmt, _ := db.Prepare("UPDATE orders SET refunded_amount = " + amount + " WHERE id = $1")
 	stmt.Exec(id)
 	w.Write([]byte("refunded " + amount))
 }
