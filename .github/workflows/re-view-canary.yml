@@ -32,6 +32,8 @@ concurrency:
 
 jobs:
   canary:
+    # Fork PRs get a read-only token and no secrets; skip them.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -69,6 +71,7 @@ jobs:
           echo "Opened PR #$pr on $branch at $head"
 
       - name: Wait for Re:View review and approval check
+        id: wait
         env:
           PR: ${{ steps.open.outputs.pr }}
           HEAD_SHA: ${{ steps.open.outputs.head }}
@@ -77,15 +80,29 @@ jobs:
           start=$SECONDS
           review="" check=""
           check_q=$(jq -rn --arg c "$CHECK_NAME" '$c|@uri')
+          # A failed poll (rate limit, 5xx) is retried, but the last error is
+          # kept so a canary fault is not mistaken for a Re:View outage.
+          # (poll runs in a subshell, so the error goes through a file.)
+          last_err="$RUNNER_TEMP/poll-last-error"
+          : > "$last_err"
+          poll() {
+            local out
+            if out=$(gh api "$@" 2>"$RUNNER_TEMP/poll.err"); then
+              printf '%s' "$out"
+            else
+              printf '%s: %s' "${1%%\?*}" "$(tr '\n' ' ' <"$RUNNER_TEMP/poll.err" | cut -c1-300)" > "$last_err"
+              echo "::warning::poll failed: $(cat "$last_err")" >&2
+            fi
+          }
           while :; do
             if [ -z "$review" ]; then
-              review=$(gh api "repos/$REPO/pulls/$PR/reviews?per_page=100" \
-                --jq "[.[] | select(.user.login == \"$BOT_LOGIN\")][0].state // empty" || true)
+              review=$(poll "repos/$REPO/pulls/$PR/reviews?per_page=100" \
+                --jq "[.[] | select(.user.login == \"$BOT_LOGIN\")][0].state // empty")
               [ -n "$review" ] && review_at=$((SECONDS - start))
             fi
             if [ -z "$check" ]; then
-              check=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs?check_name=$check_q" \
-                --jq "[.check_runs[] | select(.app.slug == \"$BOT_APP\" and .status == \"completed\")][0].conclusion // empty" || true)
+              check=$(poll "repos/$REPO/commits/$HEAD_SHA/check-runs?check_name=$check_q" \
+                --jq "[.check_runs[] | select(.app.slug == \"$BOT_APP\" and .status == \"completed\")][0].conclusion // empty")
               [ -n "$check" ] && check_at=$((SECONDS - start))
             fi
             if [ -n "$review" ] && [ -n "$check" ]; then break; fi
@@ -101,11 +118,15 @@ jobs:
             echo "| \`$CHECK_NAME\` check (completed) | ${check:-**missing**} | ${check_at:-—}s |"
             echo
             echo "PR: ${GITHUB_SERVER_URL}/${REPO}/pull/$PR, head \`$HEAD_SHA\`"
+            if [ -s "$last_err" ]; then echo; echo "Last GitHub API error while polling: \`$(cat "$last_err")\`"; fi
           } >> "$GITHUB_STEP_SUMMARY"
           echo "review=${review:-missing} check=${check:-missing}"
 
           if [ -z "$review" ] || [ -z "$check" ]; then
-            echo "::error::Re:View did not respond within ${WAIT_SECONDS}s (review=${review:-missing}, check=${check:-missing})"
+            msg="review=${review:-missing}, check=${check:-missing} after ${WAIT_SECONDS}s"
+            if [ -s "$last_err" ]; then msg="$msg; last API error: $(cat "$last_err")"; fi
+            echo "detail=$msg" >> "$GITHUB_OUTPUT"
+            echo "::error::Re:View did not respond: $msg"
             exit 1
           fi
 
@@ -126,11 +147,21 @@ jobs:
         if: failure()
         env:
           ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+          OPEN_OUTCOME: ${{ steps.open.outcome }}
+          WAIT_OUTCOME: ${{ steps.wait.outcome }}
+          WAIT_DETAIL: ${{ steps.wait.outputs.detail }}
         run: |
           if [ -z "$ALERT_WEBHOOK_URL" ]; then
             echo "::warning::ALERT_WEBHOOK_URL secret is not set; no alert sent"
             exit 0
           fi
-          text="Re:View canary FAILED in ${REPO}: no review from ${BOT_LOGIN} and/or no completed '${CHECK_NAME}' check within ${WAIT_SECONDS}s of opening a PR. Webhooks, the queue or the GitHub App may be down. Run: ${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}"
+          run_url="${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}"
+          if [ "$WAIT_OUTCOME" = failure ] && [ -n "$WAIT_DETAIL" ]; then
+            text="Re:View canary FAILED in ${REPO}: no review from ${BOT_LOGIN} and/or no completed '${CHECK_NAME}' check on a fresh PR (${WAIT_DETAIL}). Webhooks, the queue or the GitHub App may be down. Run: ${run_url}"
+          elif [ "$OPEN_OUTCOME" = failure ]; then
+            text="Re:View canary could not open its test PR in ${REPO} (canary fault, e.g. token or repo settings; Re:View itself was not tested). Run: ${run_url}"
+          else
+            text="Re:View canary failed in ${REPO} (canary step error; see the run). Run: ${run_url}"
+          fi
           jq -n --arg text "$text" '{text: $text}' |
             curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- "$ALERT_WEBHOOK_URL" -o /dev/null
