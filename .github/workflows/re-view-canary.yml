@@ -88,6 +88,7 @@ jobs:
           poll() {
             local out
             if out=$(gh api "$@" 2>"$RUNNER_TEMP/poll.err"); then
+              : > "$last_err"  # a later success clears an earlier blip
               printf '%s' "$out"
             else
               printf '%s: %s' "${1%%\?*}" "$(tr '\n' ' ' <"$RUNNER_TEMP/poll.err" | cut -c1-300)" > "$last_err"
